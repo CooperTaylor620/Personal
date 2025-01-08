@@ -1,0 +1,180 @@
+/*
+  Teensy_LBand_Corrections_SingleFile.ino
+
+  Based on SparkFun's official "NEO-D9S and NEO-D9C > Example 2: L-Band Corrections with NEO-D9S" 
+  tutorial code, combined into a single file (so no separate secrets.h is needed).
+
+  This code will:
+    1) Connect to the NEO-D9S (0x43) over I2C and configure it for L-Band corrections.
+    2) Connect to the ZED-F9P (0x42) over I2C and configure:
+       - UART2 for SPARTN corrections (coming from NEO-D9S).
+       - UART1 to output standard NMEA at 115200 baud.
+    3) Load dynamic L-Band decryption keys (current + next).
+    4) Print status to the Teensy USB serial console at 115200 baud.
+
+  After this, you can read NMEA sentences directly from the ZED-F9P's TX1 pin 
+  at 115200 (GND shared), e.g. with an FTDI cable or any TTL serial reader.
+
+  Requirements:
+    - Teensy 4.1
+    - SparkFun u-blox GNSS v3 Arduino library
+    - SparkFun Combo Board (ZED-F9P + NEO-D9S), connected via Qwiic or I2C lines
+    - L1/L2 GNSS antenna on the ZED-F9P
+    - L-Band ~1556 MHz antenna on the NEO-D9S (if in the US)
+    - A u-blox Thingstream subscription for L-Band corrections,
+      with valid dynamic keys (currentKey + nextKey).
+
+  Please replace the placeholder dynamic keys below with your real data.
+*/
+
+#include <Arduino.h>
+#include <Wire.h>
+
+// SparkFun u-blox GNSS library v3 for NEO-D9S + ZED-F9P configuration:
+#include <SparkFun_u-blox_GNSS_v3.h>
+
+// --- START "Secrets" / Dynamic Keys Section ---
+/*
+  Each key is 16 bytes, typically represented as a 32-character hex string.
+  The "current" key is valid from some GPS date/time, and the "next" key starts
+  4 weeks later, etc.
+
+  Below is just an EXAMPLE. You must replace these with your real keys & times
+  from u-blox Thingstream "L-band Location Thing" credentials.
+*/
+
+// CURRENT key info:
+const uint8_t  currentKeyLengthBytes = 16; 
+const char     currentDynamicKey[]   = "500--------------------------177"; // Example placeholder
+
+// This is the GPS week/time-of-week (when the current key becomes valid):
+const uint16_t currentKeyGPSWeek     = 2224;    // Example
+const uint32_t currentKeyGPSToW      = 518400;  // Example
+
+// NEXT key info:
+const uint8_t  nextKeyLengthBytes    = 16;
+const char     nextDynamicKey[]      = "582--------------------------a7d"; // Example placeholder
+
+// This is when the next key becomes valid (usually 4 weeks after the current):
+const uint16_t nextKeyGPSWeek        = 2228;    
+const uint32_t nextKeyGPSToW         = 518400;  
+// --- END "Secrets" / Dynamic Keys Section ---
+
+// Create objects for each module:
+SFE_UBLOX_GNSS myLBand; // NEO-D9S at I2C addr 0x43
+SFE_UBLOX_GNSS myGNSS;  // ZED-F9P at I2C addr 0x42
+
+// Choose your L-Band frequency depending on your region
+// US ~1556.29 MHz, EU ~1545.26 MHz:
+const uint32_t LBAND_FREQ_US = 1556290000UL;  // 1556.29 MHz
+//const uint32_t LBAND_FREQ_EU = 1545260000UL;  // 1545.26 MHz
+
+// Select which frequency you want to use:
+const uint32_t selectedLBandFrequency = LBAND_FREQ_US; 
+// (Uncomment LBAND_FREQ_EU above and set this if you're in Europe)
+
+void setup()
+{
+  Serial.begin(115200);
+  delay(500);
+  Serial.println();
+  Serial.println(F("SparkFun NEO-D9S + ZED-F9P L-Band Correction Demo (Single File)"));
+
+  // Initialize I2C on Teensy:
+  Wire.begin();
+  Wire.setClock(400000); // Fast mode I2C is optional
+
+  // 1) Connect to the NEO-D9S (0x43)
+  while (!myLBand.begin(Wire, 0x43))
+  {
+    Serial.println(F("NEO-D9S not detected at I2C addr 0x43. Check wiring..."));
+    delay(2000);
+  }
+  Serial.println(F("NEO-D9S connected (I2C 0x43)."));
+
+  // 2) Connect to the ZED-F9P (0x42)
+  while (!myGNSS.begin(Wire, 0x42))
+  {
+    Serial.println(F("ZED-F9P not detected at I2C addr 0x42. Check wiring..."));
+    delay(2000);
+  }
+  Serial.println(F("ZED-F9P connected (I2C 0x42)."));
+
+  // --- Configure the NEO-D9S for L-Band corrections ---
+  bool ok = true;
+
+  // Set L-Band frequency (US or EU):
+  ok &= myLBand.setVal32(UBLOX_CFG_PMP_CENTER_FREQUENCY, selectedLBandFrequency);
+  ok &= myLBand.setVal16(UBLOX_CFG_PMP_SEARCH_WINDOW,    2200); // default
+
+  // (Optionally set advanced parameters: service ID, descrambler, etc. if needed)
+
+  // Set UART2 baud to 38400 (ZED-F9P's default for UART2)
+  ok &= myLBand.setVal32(UBLOX_CFG_UART2_BAUDRATE, 38400);
+
+  // Enable UBX-RXM-PMP output on NEO-D9S UART2
+  ok &= myLBand.setVal8(UBLOX_CFG_UART2OUTPROT_UBX,         1);
+  ok &= myLBand.setVal8(UBLOX_CFG_MSGOUT_UBX_RXM_PMP_UART2, 1);
+
+  // Apply changes with a GNSS-only reset
+  myLBand.softwareResetGNSSOnly();
+
+  Serial.print(F("NEO-D9S config (L-Band) => "));
+  if (ok) Serial.println(F("OK"));
+  else    Serial.println(F("NOT OK!"));
+
+  // --- Configure the ZED-F9P to accept L-Band corrections + Output NMEA ---
+  ok = true;
+
+  // Enable SPARTN input on ZED-F9P UART2
+  ok &= myGNSS.setUART2Input(COM_TYPE_UBX | COM_TYPE_NMEA | COM_TYPE_SPARTN);
+
+  // Let it fix ambiguities if possible (DGNSS mode = FIXED)
+  ok &= myGNSS.setDGNSSConfiguration(SFE_UBLOX_DGNSS_MODE_FIXED);
+
+  // Accept LBAND PMP as correction source
+  ok &= myGNSS.setVal8(UBLOX_CFG_SPARTN_USE_SOURCE, 1);
+
+  // Configure ZED-F9P's UART1 to output NMEA @ 115200
+  ok &= myGNSS.setVal32(UBLOX_CFG_UART1_BAUDRATE, 115200);
+  ok &= myGNSS.setVal8(UBLOX_CFG_UART1OUTPROT_UBX,  0); // disable UBX on UART1
+  ok &= myGNSS.setVal8(UBLOX_CFG_UART1OUTPROT_NMEA, 1); // enable NMEA on UART1
+
+  // Enable desired NMEA sentences (1 => once per nav cycle)
+  ok &= myGNSS.setVal8(UBLOX_CFG_MSGOUT_NMEA_GGA_UART1, 1);
+  ok &= myGNSS.setVal8(UBLOX_CFG_MSGOUT_NMEA_RMC_UART1, 1);
+  // ...Add more if you want: GSA, GSV, etc.
+
+  // Save config so it persists (optional)
+  ok &= myGNSS.saveConfiguration();
+
+  Serial.print(F("ZED-F9P config => "));
+  if (ok) Serial.println(F("OK"));
+  else    Serial.println(F("NOT OK!"));
+
+  // --- Load dynamic keys for L-Band corrections (SPARTN) ---
+  bool keyOK = myGNSS.setDynamicSPARTNKeys(
+    currentKeyLengthBytes, currentKeyGPSWeek, currentKeyGPSToW, currentDynamicKey,
+    nextKeyLengthBytes,    nextKeyGPSWeek,    nextKeyGPSToW,    nextDynamicKey
+  );
+
+  if (keyOK)
+    Serial.println(F("Dynamic L-Band keys loaded successfully."));
+  else
+    Serial.println(F("Error loading dynamic keys! Check your key strings and times."));
+
+  // --- Setup done! ---
+  Serial.println(F("\nSetup complete. NEO-D9S -> ZED-F9P corrections on UART2."));
+  Serial.println(F("ZED-F9P => NMEA on UART1 at 115200. Connect TX1 to a serial reader."));
+}
+
+void loop()
+{
+  // Continuously check for any inbound messages from each module
+  // (for advanced usage, e.g. if you want to query status or log debug info).
+
+  myLBand.checkUblox();
+  myGNSS.checkUblox();
+
+  delay(100);
+}
